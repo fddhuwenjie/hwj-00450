@@ -1,0 +1,17 @@
+2024-01-01 08:30:01 INFO  [Request #1001] 用户登录开始
+2024-01-01 08:30:02 DEBUG [Request #1001] 执行SQL: SELECT * FROM users WHERE name LIKE '%张%' AND status = 'active'
+2024-01-01 08:30:03 INFO  [Request #1001] 响应返回 200 OK (45ms)
+2024-01-01 08:30:05 INFO  [Request #1002] 查询订单列表
+2024-01-01 08:30:05 DEBUG [Request #1002] SQL = "SELECT u.name, o.* FROM users u JOIN orders o ON u.id = o.user_id WHERE u.city = '北京' ORDER BY o.created_at DESC"
+2024-01-01 08:30:06 WARN  [Request #1002] 查询耗时 820ms，超过阈值500ms
+2024-01-01 08:30:10 INFO  [Request #1003] 检查未取消订单用户
+2024-01-01 08:30:10 DEBUG [Request #1003] SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE status = 'cancelled');
+2024-01-01 08:30:12 ERROR [Request #1003] 超时: 查询执行超过 30 秒
+2024-01-01 08:30:15 INFO  [Request #1004] 统计今日订单
+2024-01-01 08:30:15 DEBUG [Request #1004] 执行SQL：SELECT COUNT(*) FROM orders WHERE DATE(created_at) = '2024-01-01';
+2024-01-01 08:30:16 INFO  [Request #1005] 搜索商品
+2024-01-01 08:30:16 DEBUG [Request #1005] SELECT * FROM products WHERE category = '电子' AND price > 1000;
+2024-01-01 08:30:20 INFO  [Request #1006] 批量更新用户
+2024-01-01 08:30:20 DEBUG [Request #1006] UPDATE users SET age = age + 1 WHERE status = 'active';
+2024-01-01 08:30:25 INFO  [DailyJob] 开始每日报表统计
+2024-01-01 08:30:25 DEBUG [DailyJob] SELECT p.category, SUM(o.total_price) FROM orders o JOIN products p ON o.product_id = p.id GROUP BY p.category;
