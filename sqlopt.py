@@ -1622,8 +1622,9 @@ def cmd_analyze(args):
     print_section("2️⃣  索引建议")
     advisor = IndexAdvisor(parsed, db_path)
     indexes = advisor.advise()
+    indexes = schema_enhance_indexes(indexes, parsed, db_path)
     if not indexes:
-        print("  ✅ 暂无索引建议")
+        print("  ✅ 暂无索引建议 (部分可能已有索引覆盖)")
     for idx, sug in enumerate(indexes, 1):
         sev_color = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}.get(sug['severity'], '⚪')
         print(f"  {sev_color} [{idx}] {sug['type']}")
@@ -1632,6 +1633,16 @@ def cmd_analyze(args):
         print(f"     SQL:  {sug['sql']}")
         if idx != len(indexes):
             print()
+
+    schema_enhancements = schema_enhance_analysis(parsed, sql, db_path)
+    if schema_enhancements:
+        print_section("2️⃣.5  Schema 感知增强分析")
+        for idx, enh in enumerate(schema_enhancements, 1):
+            sev = {'critical': '🔴 严重', 'high': '🟠 高', 'medium': '🟡 中', 'low': '🟢 低'}.get(enh['severity'], '⚪')
+            print(f"  {sev} [{idx}] {enh['type']}")
+            print(f"     详情: {enh['detail']}")
+            if idx != len(schema_enhancements):
+                print()
 
     print_section("3️⃣  反模式检测")
     detector = AntiPatternDetector(sql, parsed, db_path)
@@ -1729,6 +1740,1237 @@ def cmd_samples(args):
         print()
 
 
+SQLITE_RESERVED_WORDS = {
+    'ABORT', 'ACTION', 'ADD', 'AFTER', 'ALL', 'ALTER', 'ALWAYS', 'ANALYZE', 'AND', 'AS', 'ASC',
+    'ATTACH', 'AUTOINCREMENT', 'BEFORE', 'BEGIN', 'BETWEEN', 'BY', 'CASCADE', 'CASE', 'CAST',
+    'CHECK', 'COLLATE', 'COLUMN', 'COMMIT', 'CONFLICT', 'CONSTRAINT', 'CREATE', 'CROSS',
+    'CURRENT', 'CURRENT_DATE', 'CURRENT_TIME', 'CURRENT_TIMESTAMP', 'DATABASE', 'DEFAULT',
+    'DEFERRABLE', 'DEFERRED', 'DELETE', 'DESC', 'DETACH', 'DISTINCT', 'DO', 'DROP', 'EACH',
+    'ELSE', 'END', 'ESCAPE', 'EXCEPT', 'EXCLUDE', 'EXCLUSIVE', 'EXISTS', 'EXPLAIN', 'FAIL',
+    'FILTER', 'FOLLOWING', 'FOR', 'FOREIGN', 'FROM', 'FULL', 'GENERATED', 'GLOB', 'GROUP',
+    'GROUPS', 'HAVING', 'IF', 'IGNORE', 'IMMEDIATE', 'IN', 'INDEX', 'INDEXED', 'INITIALLY',
+    'INNER', 'INSERT', 'INSTEAD', 'INTERSECT', 'INTO', 'IS', 'ISNULL', 'JOIN', 'KEY', 'LEFT',
+    'LIKE', 'LIMIT', 'MATCH', 'NATURAL', 'NO', 'NOT', 'NOTHING', 'NOTNULL', 'NULL', 'NULLS',
+    'OF', 'OFFSET', 'ON', 'OR', 'ORDER', 'OTHERS', 'OUTER', 'OVER', 'PARTITION', 'PLAN',
+    'PRAGMA', 'PRECEDING', 'PRIMARY', 'QUERY', 'RAISE', 'RANGE', 'RECURSIVE', 'REFERENCES',
+    'REGEXP', 'REINDEX', 'RELEASE', 'RENAME', 'REPLACE', 'RESTRICT', 'RETURNING', 'RIGHT',
+    'ROLLBACK', 'ROW', 'ROWS', 'SAVEPOINT', 'SELECT', 'SET', 'TABLE', 'TEMP', 'TEMPORARY',
+    'THEN', 'TIES', 'TO', 'TRANSACTION', 'TRIGGER', 'UNBOUNDED', 'UNION', 'UNIQUE', 'UPDATE',
+    'USING', 'VACUUM', 'VALUES', 'VIEW', 'VIRTUAL', 'WHEN', 'WHERE', 'WINDOW', 'WITH', 'WITHOUT',
+}
+
+
+class ComplexityScorer:
+    DIMENSION_WEIGHTS = {
+        'table_count': 0.20,
+        'join_depth': 0.25,
+        'subquery_depth': 0.25,
+        'where_count': 0.15,
+        'temp_sort': 0.15,
+    }
+
+    def __init__(self, sql, parsed=None, db_path=None):
+        self.sql = sql
+        self.parsed = parsed
+        self.db_path = db_path
+        if self.parsed is None:
+            parser = SQLParser(sql)
+            self.parsed = parser.parse()
+
+    def score(self):
+        dims = {
+            'table_count': self._score_table_count(),
+            'join_depth': self._score_join_depth(),
+            'subquery_depth': self._score_subquery_depth(),
+            'where_count': self._score_where_count(),
+            'temp_sort': self._score_temp_sort(),
+        }
+        total = 0.0
+        for k, v in dims.items():
+            total += v['score'] * self.DIMENSION_WEIGHTS[k]
+        final_score = int(round(100 - total))
+        final_score = max(0, min(100, final_score))
+        return {
+            'score': final_score,
+            'grade': self._grade(final_score),
+            'dimensions': dims,
+        }
+
+    def _grade(self, score):
+        if score >= 85:
+            return 'A (优秀, 低复杂度)'
+        elif score >= 70:
+            return 'B (良好, 较低复杂度)'
+        elif score >= 55:
+            return 'C (一般, 中等复杂度)'
+        elif score >= 40:
+            return 'D (较差, 高复杂度)'
+        else:
+            return 'F (很差, 极高复杂度)'
+
+    def _score_table_count(self):
+        tables = self.parsed.get('_tables', [])
+        joins = self.parsed.get('_joins', [])
+        total = len(tables) + len(joins)
+        raw = total
+        if total <= 1:
+            penalty = 0
+        elif total == 2:
+            penalty = 15
+        elif total == 3:
+            penalty = 30
+        elif total == 4:
+            penalty = 50
+        elif total == 5:
+            penalty = 70
+        else:
+            penalty = min(100, 70 + (total - 5) * 8)
+        return {
+            'name': '涉及表数量',
+            'value': total,
+            'raw': raw,
+            'score': penalty,
+            'description': f'涉及 {total} 张表' + ('，建议简化关联' if total >= 3 else ''),
+        }
+
+    def _score_join_depth(self):
+        joins = self.parsed.get('_joins', [])
+        depth = len(joins)
+        raw = depth
+        if depth == 0:
+            penalty = 0
+        elif depth == 1:
+            penalty = 10
+        elif depth == 2:
+            penalty = 25
+        elif depth == 3:
+            penalty = 45
+        elif depth == 4:
+            penalty = 65
+        else:
+            penalty = min(100, 65 + (depth - 4) * 10)
+        return {
+            'name': 'JOIN 层数',
+            'value': depth,
+            'raw': raw,
+            'score': penalty,
+            'description': f'{depth} 层 JOIN' + ('，JOIN 过深影响性能' if depth >= 3 else ''),
+        }
+
+    def _score_subquery_depth(self):
+        depth = self._calc_subquery_depth(self.sql)
+        raw = depth
+        if depth == 0:
+            penalty = 0
+        elif depth == 1:
+            penalty = 15
+        elif depth == 2:
+            penalty = 40
+        elif depth == 3:
+            penalty = 70
+        else:
+            penalty = min(100, 70 + (depth - 3) * 10)
+        return {
+            'name': '子查询嵌套深度',
+            'value': depth,
+            'raw': raw,
+            'score': penalty,
+            'description': f'嵌套 {depth} 层子查询' + ('，建议改写为 JOIN' if depth >= 2 else ''),
+        }
+
+    def _calc_subquery_depth(self, sql):
+        tokens = tokenize_sql(sql)
+        max_depth = 0
+        current = 0
+        i = 0
+        while i < len(tokens):
+            if tokens[i] == '(':
+                if i + 1 < len(tokens) and tokens[i + 1].upper() == 'SELECT':
+                    current += 1
+                    max_depth = max(max_depth, current)
+            elif tokens[i] == ')':
+                if current > 0:
+                    end = find_matching_paren(tokens, i - 1)
+                    if end == i:
+                        current -= 1
+            i += 1
+        return max_depth
+
+    def _score_where_count(self):
+        conds = [c for c in self.parsed.get('_where_conditions', [])
+                 if not c.startswith('逻辑符:')]
+        having = [c for c in self.parsed.get('_having', []) if not c.startswith('逻辑符:')]
+        total = len(conds) + len(having)
+        raw = total
+        if total <= 2:
+            penalty = 0
+        elif total <= 4:
+            penalty = 15
+        elif total <= 6:
+            penalty = 35
+        elif total <= 8:
+            penalty = 55
+        else:
+            penalty = min(100, 55 + (total - 8) * 5)
+        return {
+            'name': 'WHERE 条件数量',
+            'value': total,
+            'raw': raw,
+            'score': penalty,
+            'description': f'{total} 个条件' + ('，复杂条件需注意索引设计' if total >= 4 else ''),
+        }
+
+    def _score_temp_sort(self):
+        has_temp = False
+        reasons = []
+        order_by = self.parsed.get('_order_by', [])
+        group_by = self.parsed.get('_group_by', [])
+        distinct = self.parsed.get('_distinct', False)
+        if distinct and not order_by and not group_by:
+            has_temp = True
+            reasons.append('DISTINCT 去重需要临时 B-Tree')
+        if order_by and group_by:
+            has_temp = True
+            reasons.append('同时有 ORDER BY 和 GROUP BY')
+        if len(group_by) >= 2:
+            has_temp = True
+            reasons.append('多列 GROUP BY')
+        if len(order_by) >= 2:
+            has_temp = True
+            reasons.append('多列 ORDER BY')
+        if self.db_path and os.path.exists(self.db_path):
+            try:
+                analyzer = ExplainPlanAnalyzer(self.sql, self.db_path)
+                plan = analyzer.analyze()
+                for p in plan:
+                    if 'TEMP B-TREE' in p.get('raw', '').upper():
+                        has_temp = True
+                        reasons.append(p.get('detail', '使用临时 B-Tree'))
+                        break
+            except:
+                pass
+        raw = 1 if has_temp else 0
+        penalty = 60 if has_temp else 0
+        desc = '; '.join(reasons) if reasons else ('使用临时表排序' if has_temp else '无临时表排序开销')
+        return {
+            'name': '临时表排序',
+            'value': has_temp,
+            'raw': raw,
+            'score': penalty,
+            'description': desc,
+        }
+
+
+class SchemaManager:
+    CACHE_FILE = '.sqlopt_schema.json'
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.cache_path = os.path.join(os.path.dirname(os.path.abspath(db_path)) if os.path.dirname(db_path) else '.', self.CACHE_FILE)
+        self.schema = None
+        self._load()
+
+    def _db_mtime(self):
+        if not os.path.exists(self.db_path):
+            return 0
+        return os.path.getmtime(self.db_path)
+
+    def _cache_mtime(self):
+        if not os.path.exists(self.cache_path):
+            return 0
+        return os.path.getmtime(self.cache_path)
+
+    def _load(self):
+        db_mtime = self._db_mtime()
+        cache_mtime = self._cache_mtime()
+        if cache_mtime > 0 and cache_mtime >= db_mtime and db_mtime > 0:
+            try:
+                with open(self.cache_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if data.get('db_path') == os.path.abspath(self.db_path):
+                    self.schema = data.get('schema', {})
+                    return
+            except:
+                pass
+        self._extract()
+        self._save_cache()
+
+    def refresh(self):
+        self._extract()
+        self._save_cache()
+
+    def _save_cache(self):
+        try:
+            with open(self.cache_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'db_path': os.path.abspath(self.db_path),
+                    'db_mtime': self._db_mtime(),
+                    'schema': self.schema,
+                }, f, ensure_ascii=False, indent=2)
+        except:
+            pass
+
+    def _extract(self):
+        self.schema = {}
+        if not os.path.exists(self.db_path):
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            tables = [r[0] for r in cur.fetchall()]
+            for table in tables:
+                table_info = {'name': table, 'columns': [], 'indexes': [], 'foreign_keys': []}
+                cur.execute(f'PRAGMA table_info("{table}")')
+                for col in cur.fetchall():
+                    cid, name, col_type, notnull, default, pk = col
+                    table_info['columns'].append({
+                        'cid': cid,
+                        'name': name,
+                        'type': col_type,
+                        'not_null': bool(notnull),
+                        'default': default,
+                        'primary_key': bool(pk),
+                    })
+                cur.execute(f'PRAGMA foreign_key_list("{table}")')
+                for fk in cur.fetchall():
+                    table_info['foreign_keys'].append({
+                        'id': fk[0],
+                        'seq': fk[1],
+                        'table': fk[2],
+                        'from': fk[3],
+                        'to': fk[4],
+                    })
+                cur.execute(f'PRAGMA index_list("{table}")')
+                indexes_raw = cur.fetchall()
+                for idx in indexes_raw:
+                    idx_name = idx[1]
+                    idx_unique = bool(idx[2])
+                    idx_origin = idx[3]
+                    if idx_origin == 'pk':
+                        continue
+                    cur.execute(f'PRAGMA index_info("{idx_name}")')
+                    idx_cols = [c[2] for c in cur.fetchall()]
+                    table_info['indexes'].append({
+                        'name': idx_name,
+                        'unique': idx_unique,
+                        'columns': idx_cols,
+                    })
+                self.schema[table] = table_info
+            conn.close()
+        except Exception as e:
+            self.schema = {'_error': str(e)}
+
+    def get_table(self, table_name):
+        if not self.schema:
+            return None
+        for name, info in self.schema.items():
+            if name.lower() == table_name.lower():
+                return info
+        return None
+
+    def get_column(self, table_name, column_name):
+        table = self.get_table(table_name)
+        if not table:
+            return None
+        for col in table['columns']:
+            if col['name'].lower() == column_name.lower():
+                return col
+        return None
+
+    def column_has_index(self, table_name, column_name):
+        table = self.get_table(table_name)
+        if not table:
+            return False
+        col_lower = column_name.lower()
+        for idx in table.get('indexes', []):
+            if idx['columns'] and idx['columns'][0].lower() == col_lower:
+                return True
+        for col in table.get('columns', []):
+            if col['primary_key'] and col['name'].lower() == col_lower:
+                return True
+        return False
+
+    def get_index_for_columns(self, table_name, columns):
+        table = self.get_table(table_name)
+        if not table:
+            return None
+        cols_lower = [c.lower() for c in columns]
+        for idx in table.get('indexes', []):
+            idx_cols_lower = [c.lower() for c in idx['columns']]
+            if idx_cols_lower[:len(cols_lower)] == cols_lower:
+                return idx
+        if len(columns) == 1:
+            for col in table.get('columns', []):
+                if col['primary_key'] and col['name'].lower() == cols_lower[0]:
+                    return {'name': f'{table_name}_pkey', 'unique': True, 'columns': [columns[0]]}
+        return None
+
+    def get_join_column_types(self, left_table, left_col, right_table, right_col):
+        lc = self.get_column(left_table, left_col)
+        rc = self.get_column(right_table, right_col)
+        ltype = lc['type'] if lc else None
+        rtype = rc['type'] if rc else None
+        return ltype, rtype
+
+    def is_type_match(self, type1, type2):
+        if not type1 or not type2:
+            return True
+        t1 = type1.upper().strip()
+        t2 = type2.upper().strip()
+        if t1 == t2:
+            return True
+        int_family = {'INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'MEDIUMINT'}
+        text_family = {'TEXT', 'VARCHAR', 'CHAR', 'NVARCHAR', 'NCHAR', 'CLOB', 'STRING'}
+        real_family = {'REAL', 'FLOAT', 'DOUBLE', 'DECIMAL', 'NUMERIC'}
+        blob_family = {'BLOB', 'BINARY', 'VARBINARY'}
+        families = [int_family, text_family, real_family, blob_family]
+        for fam in families:
+            if any(t1.startswith(f) or f in t1 for f in fam):
+                if any(t2.startswith(f) or f in t2 for f in fam):
+                    return True
+                return False
+        return True
+
+    def is_not_null(self, table_name, column_name):
+        col = self.get_column(table_name, column_name)
+        if col:
+            return col['not_null']
+        return False
+
+
+def schema_enhance_analysis(parsed, sql, db_path):
+    enhancements = []
+    if not db_path or not os.path.exists(db_path):
+        return enhancements
+    schema_mgr = SchemaManager(db_path)
+    tables = parsed.get('_tables', [])
+    joins = parsed.get('_joins', [])
+    where_conds = parsed.get('_where_conditions', [])
+    all_tables = []
+    for t in tables:
+        base = t.split()[0].split(' AS ')[0].strip('`"')
+        alias = None
+        if ' AS ' in t.upper():
+            alias = t.split(' AS ')[1].strip().strip('`"').split()[0]
+        elif len(t.split()) >= 2:
+            alias = t.split()[-1].strip('`"')
+        all_tables.append({'base': base, 'alias': alias or base})
+    for j in joins:
+        tbl = j['table'].split()[0].split(' AS ')[0].strip('`"')
+        alias = None
+        if ' AS ' in j['table'].upper():
+            alias = j['table'].split(' AS ')[1].strip().strip('`"').split()[0]
+        elif len(j['table'].split()) >= 2:
+            alias = j['table'].split()[-1].strip('`"')
+        all_tables.append({'base': tbl, 'alias': alias or tbl})
+
+    def resolve_table(col):
+        if '.' in col:
+            prefix = col.split('.')[0].strip('`"')
+            for t in all_tables:
+                if t['alias'].lower() == prefix.lower() or t['base'].lower() == prefix.lower():
+                    return t['base'], col.split('.', 1)[1].strip('`"')
+        col_simple = col.strip('`"')
+        for t in all_tables:
+            if schema_mgr.get_column(t['base'], col_simple):
+                return t['base'], col_simple
+        if all_tables:
+            return all_tables[0]['base'], col_simple
+        return None, col_simple
+
+    for j in joins:
+        for cond in j.get('conditions', []):
+            if cond.startswith('逻辑符:'):
+                continue
+            advisor = IndexAdvisor.__new__(IndexAdvisor)
+            advisor.parsed = parsed
+            col, op, val = advisor._parse_condition(cond)
+            if col and op == '=' and val and '.' in col and '.' in val:
+                left_table, left_col = resolve_table(col)
+                right_table, right_col = resolve_table(val)
+                if left_table and right_table:
+                    ltype, rtype = schema_mgr.get_join_column_types(left_table, left_col, right_table, right_col)
+                    if ltype and rtype and not schema_mgr.is_type_match(ltype, rtype):
+                        enhancements.append({
+                            'severity': 'high',
+                            'type': '隐式类型转换风险',
+                            'detail': f'JOIN 列类型不匹配: {left_table}.{left_col} ({ltype}) vs {right_table}.{right_col} ({rtype})',
+                        })
+    for cond in where_conds:
+        if cond.startswith('逻辑符:'):
+            continue
+        advisor = IndexAdvisor.__new__(IndexAdvisor)
+        advisor.parsed = parsed
+        col, op, val = advisor._parse_condition(cond)
+        if not col:
+            continue
+        tbl, col_simple = resolve_table(col)
+        if not tbl:
+            continue
+        if op in ('IS', 'IS NOT'):
+            if val and ('NULL' in val.upper()):
+                if schema_mgr.is_not_null(tbl, col_simple):
+                    enhancements.append({
+                        'severity': 'low',
+                        'type': '冗余 IS NULL 检查',
+                        'detail': f'{tbl}.{col_simple} 为 NOT NULL 列，无需 IS NULL 检查',
+                    })
+    return enhancements
+
+
+def schema_enhance_indexes(suggestions, parsed, db_path):
+    if not db_path or not os.path.exists(db_path):
+        return suggestions
+    schema_mgr = SchemaManager(db_path)
+    filtered = []
+    for sug in suggestions:
+        tbl = sug['table'].split()[0].split(' AS ')[0].strip('`"')
+        cols = sug['columns']
+        existing = schema_mgr.get_index_for_columns(tbl, cols)
+        if existing:
+            continue
+        filtered.append(sug)
+    return filtered
+
+
+class SQLFormatter:
+    CLAUSE_ORDER = [
+        'SELECT', 'FROM', 'WHERE', 'GROUP BY', 'HAVING',
+        'WINDOW', 'UNION', 'UNION ALL', 'INTERSECT', 'EXCEPT',
+        'ORDER BY', 'LIMIT', 'OFFSET',
+    ]
+
+    def __init__(self, sql, keyword_case='upper', indent='    ', comma_position='leading'):
+        self.sql = sql.strip().rstrip(';')
+        self.keyword_case = keyword_case
+        self.indent = indent
+        self.comma_position = comma_position
+
+    def format(self):
+        tokens = self._tokenize_formatted(self.sql)
+        if not tokens:
+            return ''
+        lines = self._build_lines(tokens)
+        result = '\n'.join(lines) + ';'
+        return result
+
+    def _tokenize_formatted(self, sql):
+        tokens = []
+        buf = []
+        i = 0
+        in_string = False
+        string_char = None
+        while i < len(sql):
+            ch = sql[i]
+            if in_string:
+                buf.append(ch)
+                if ch == string_char:
+                    if i + 1 < len(sql) and sql[i + 1] == string_char:
+                        buf.append(sql[i + 1])
+                        i += 1
+                    else:
+                        in_string = False
+            else:
+                if ch in ("'", '"', '`'):
+                    if buf:
+                        tokens.append(('id', ''.join(buf)))
+                        buf = []
+                    in_string = True
+                    string_char = ch
+                    buf = [ch]
+                elif ch in '(),':
+                    if buf:
+                        tokens.append(('id', ''.join(buf)))
+                        buf = []
+                    tokens.append(('punct', ch))
+                elif ch.isspace():
+                    if buf:
+                        tokens.append(('id', ''.join(buf)))
+                        buf = []
+                elif ch in '=<>!+-*/%':
+                    if buf:
+                        tokens.append(('id', ''.join(buf)))
+                        buf = []
+                    j = i
+                    while j < len(sql) and sql[j] in '=<>!+-*/%':
+                        j += 1
+                    tokens.append(('op', sql[i:j]))
+                    i = j - 1
+                else:
+                    buf.append(ch)
+            i += 1
+        if buf:
+            tokens.append(('id', ''.join(buf)))
+        processed = []
+        for ttype, tval in tokens:
+            if ttype == 'id' and tval.upper() in SQL_KEYWORDS:
+                if self.keyword_case == 'upper':
+                    processed.append(('kw', tval.upper()))
+                elif self.keyword_case == 'lower':
+                    processed.append(('kw', tval.lower()))
+                else:
+                    processed.append(('kw', tval))
+            else:
+                processed.append((ttype, tval))
+        return processed
+
+    def _build_lines(self, tokens):
+        lines = []
+        current = []
+        depth = 0
+        paren_depth = 0
+        i = 0
+        new_clause_keywords = {'SELECT', 'FROM', 'WHERE', 'GROUP', 'HAVING', 'WINDOW', 'UNION', 'INTERSECT', 'EXCEPT', 'ORDER', 'LIMIT', 'OFFSET', 'VALUES', 'SET'}
+
+        def flush():
+            nonlocal current
+            if current:
+                line = self.indent * max(0, depth - 1) + ' '.join(current)
+                if line.strip():
+                    lines.append(line)
+                current = []
+
+        while i < len(tokens):
+            ttype, tval = tokens[i]
+            if ttype == 'kw':
+                if tval == 'BY' and i > 0 and tokens[i - 1][1].upper() in ('GROUP', 'ORDER', 'PARTITION', 'WINDOW'):
+                    current.append(tval)
+                    flush()
+                    i += 1
+                    continue
+                if tval == 'ALL' and i > 0 and tokens[i - 1][1].upper() == 'UNION':
+                    current[-1] = current[-1] + ' ' + tval
+                    i += 1
+                    continue
+                if tval.upper() in new_clause_keywords:
+                    flush()
+                    depth = 1 if tval.upper() in ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'WITH') else max(1, depth)
+                    clause_kw = tval
+                    if tval.upper() in ('GROUP', 'ORDER') and i + 1 < len(tokens) and tokens[i + 1][1].upper() == 'BY':
+                        clause_kw = tval + ' BY'
+                    current.append(clause_kw)
+                    flush()
+                    depth = 2
+                    if tval.upper() in ('GROUP', 'ORDER'):
+                        i += 2
+                    else:
+                        i += 1
+                    continue
+                if tval.upper() in ('LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'NATURAL', 'FULL'):
+                    join_parts = [tval]
+                    j = i + 1
+                    while j < len(tokens) and tokens[j][1].upper() in ('LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'NATURAL', 'FULL', 'JOIN'):
+                        join_parts.append(tokens[j][1])
+                        j += 1
+                        if join_parts[-1].upper() == 'JOIN':
+                            break
+                    flush()
+                    current.append(' '.join(join_parts))
+                    i = j
+                    continue
+                if tval.upper() == 'JOIN':
+                    flush()
+                    current.append(tval)
+                    i += 1
+                    continue
+                if tval.upper() in ('AND', 'OR'):
+                    flush()
+                    current.append(tval)
+                    i += 1
+                    continue
+                if tval.upper() == 'AS':
+                    current.append(tval)
+                    i += 1
+                    continue
+            if ttype == 'punct':
+                if tval == '(':
+                    current.append(tval)
+                    paren_depth += 1
+                    depth += 1
+                    i += 1
+                    continue
+                if tval == ')':
+                    flush()
+                    paren_depth -= 1
+                    depth = max(1, depth - 1)
+                    if self.comma_position == 'leading':
+                        line = self.indent * max(0, depth - 1) + tval
+                    else:
+                        line = (self.indent * max(0, depth - 1) + tval) if lines else tval
+                    lines.append(line)
+                    i += 1
+                    continue
+                if tval == ',':
+                    if self.comma_position == 'trailing':
+                        current.append(tval)
+                        flush()
+                    else:
+                        flush()
+                        current.append(tval)
+                    i += 1
+                    continue
+            current.append(tval)
+            i += 1
+        flush()
+        return lines
+
+
+class SQLLinter:
+    DEFAULT_RULES = {
+        'snake_case_table': True,
+        'snake_case_column': True,
+        'avoid_reserved_words': True,
+        'join_must_have_on': True,
+        'meaningful_alias': True,
+        'select_star': True,
+        'no_trailing_whitespace': True,
+    }
+    RULE_DESCRIPTIONS = {
+        'snake_case_table': '表名应使用小写蛇形命名',
+        'snake_case_column': '列名应使用小写蛇形命名',
+        'avoid_reserved_words': '避免使用保留字作为列名或表名',
+        'join_must_have_on': 'JOIN 必须有 ON 条件',
+        'meaningful_alias': '别名应有意义，避免单字母别名',
+        'select_star': '避免使用 SELECT *',
+        'no_trailing_whitespace': '避免行尾空格',
+    }
+
+    def __init__(self, sql, rules=None, config_path='.sqlopt.yaml'):
+        self.sql = sql
+        self.rules = dict(self.DEFAULT_RULES)
+        if rules:
+            self.rules.update(rules)
+        self._load_config(config_path)
+        self.issues = []
+        try:
+            self.parser = SQLParser(sql)
+            self.parsed = self.parser.parse()
+        except:
+            self.parsed = None
+
+    def _load_config(self, config_path):
+        if not os.path.exists(config_path):
+            return
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self._parse_simple_yaml(content)
+        except:
+            pass
+
+    def _parse_simple_yaml(self, content):
+        in_rules = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            if stripped == 'rules:':
+                in_rules = True
+                continue
+            if in_rules and stripped.startswith('- '):
+                rule = stripped[2:].strip()
+                if rule.startswith('no_'):
+                    rname = rule[3:]
+                    if rname in self.rules:
+                        self.rules[rname] = False
+                else:
+                    rname = rule
+                    if rname in self.rules:
+                        self.rules[rname] = True
+            elif ':' in stripped and not stripped.startswith('-'):
+                k, v = stripped.split(':', 1)
+                k = k.strip()
+                v = v.strip().lower()
+                if k in self.rules:
+                    self.rules[k] = v in ('true', 'yes', 'on', '1')
+
+    def lint(self):
+        if self.rules.get('select_star'):
+            self._check_select_star()
+        if self.rules.get('join_must_have_on'):
+            self._check_join_on()
+        if self.rules.get('meaningful_alias'):
+            self._check_alias()
+        if self.rules.get('avoid_reserved_words'):
+            self._check_reserved_words()
+        if self.rules.get('snake_case_table'):
+            self._check_snake_case_tables()
+        if self.rules.get('snake_case_column'):
+            self._check_snake_case_columns()
+        if self.rules.get('no_trailing_whitespace'):
+            self._check_trailing_space()
+        return self.issues
+
+    def _check_select_star(self):
+        if not self.parsed:
+            return
+        cols = self.parsed.get('_select_cols', [])
+        if '*' in cols:
+            self.issues.append({
+                'rule': 'select_star',
+                'severity': 'high',
+                'line': self._find_line('SELECT') + 1,
+                'message': self.RULE_DESCRIPTIONS['select_star'],
+            })
+
+    def _check_join_on(self):
+        if not self.parsed:
+            return
+        joins = self.parsed.get('_joins', [])
+        for idx, j in enumerate(joins):
+            if not j.get('conditions'):
+                self.issues.append({
+                    'rule': 'join_must_have_on',
+                    'severity': 'critical',
+                    'line': self._find_line(j['type']) + 1,
+                    'message': f'{j["type"]} 缺少 ON 条件: {j["table"]}',
+                })
+
+    def _check_alias(self):
+        if not self.parsed:
+            return
+        tables = self.parsed.get('_tables', []) + [j['table'] for j in self.parsed.get('_joins', [])]
+        for t in tables:
+            parts = t.split()
+            alias = None
+            if ' AS ' in t.upper():
+                alias = t.split(' AS ')[1].strip().strip('`"').split()[0]
+            elif len(parts) >= 2:
+                alias = parts[-1].strip('`"')
+            if alias and len(alias) == 1 and alias.isalpha():
+                self.issues.append({
+                    'rule': 'meaningful_alias',
+                    'severity': 'low',
+                    'line': self._find_line(alias) + 1,
+                    'message': f'别名 "{alias}" 过于简短，建议使用有意义的别名',
+                })
+
+    def _check_reserved_words(self):
+        if not self.parsed:
+            return
+        identifiers = set()
+        tables = self.parsed.get('_tables', []) + [j['table'] for j in self.parsed.get('_joins', [])]
+        for t in tables:
+            base = t.split()[0].split(' AS ')[0].strip('`"')
+            identifiers.add(base)
+            if ' AS ' in t.upper():
+                alias = t.split(' AS ')[1].strip().strip('`"').split()[0]
+                identifiers.add(alias)
+            elif len(t.split()) >= 2:
+                alias = t.split()[-1].strip('`"')
+                identifiers.add(alias)
+        if self.parsed.get('_table'):
+            identifiers.add(self.parsed['_table'])
+        for c in self.parsed.get('_select_cols', []):
+            if c == '*':
+                continue
+            clean = c.split('.')[-1].strip('`"() ').strip()
+            if clean and re.match(r'^[a-zA-Z_]\w*$', clean):
+                identifiers.add(clean)
+        where = [c for c in self.parsed.get('_where_conditions', []) if not c.startswith('逻辑符:')]
+        for w in where:
+            for part in re.split(r'[=<>!+\-*/%]', w):
+                p = part.strip().split('.')[-1].strip('`" ').strip()
+                if p and re.match(r'^[a-zA-Z_]\w*$', p):
+                    identifiers.add(p)
+        for ident in identifiers:
+            upper = ident.upper()
+            if upper in SQLITE_RESERVED_WORDS:
+                self.issues.append({
+                    'rule': 'avoid_reserved_words',
+                    'severity': 'medium',
+                    'line': self._find_line(ident) + 1,
+                    'message': f'"{ident}" 是 SQLite 保留字，建议加反引号或改名',
+                })
+
+    def _check_snake_case_tables(self):
+        if not self.parsed:
+            return
+        tables = []
+        for t in self.parsed.get('_tables', []):
+            tables.append(t.split()[0].split(' AS ')[0].strip('`"'))
+        for j in self.parsed.get('_joins', []):
+            tables.append(j['table'].split()[0].split(' AS ')[0].strip('`"'))
+        if self.parsed.get('_table'):
+            tables.append(self.parsed['_table'])
+        for t in tables:
+            if t.startswith('sqlite_'):
+                continue
+            if t != t.lower() or ' ' in t:
+                self.issues.append({
+                    'rule': 'snake_case_table',
+                    'severity': 'medium',
+                    'line': self._find_line(t) + 1,
+                    'message': f'表名 "{t}" 不符合小写蛇形命名规范',
+                })
+            elif not re.match(r'^[a-z][a-z0-9_]*$', t):
+                self.issues.append({
+                    'rule': 'snake_case_table',
+                    'severity': 'medium',
+                    'line': self._find_line(t) + 1,
+                    'message': f'表名 "{t}" 应使用小写蛇形命名 (lower_snake_case)',
+                })
+
+    def _check_snake_case_columns(self):
+        if not self.parsed:
+            return
+        cols = []
+        for c in self.parsed.get('_select_cols', []):
+            if c == '*':
+                continue
+            clean = c.split('.')[-1].strip('`"() ').strip()
+            if clean and not clean.startswith('COUNT') and not clean.startswith('SUM') and not clean.startswith('AVG') and not clean.startswith('MIN') and not clean.startswith('MAX'):
+                cols.append(clean)
+        where = [c for c in self.parsed.get('_where_conditions', []) if not c.startswith('逻辑符:')]
+        for w in where:
+            for part in re.split(r'[=<>!+\-*/%]', w):
+                p = part.strip().split('.')[-1].strip('`" ').strip()
+                if p and re.match(r'^[a-zA-Z_]', p):
+                    cols.append(p)
+        for c in cols:
+            if not c or not re.match(r'^[a-zA-Z_]', c):
+                continue
+            if c != c.lower() or ' ' in c:
+                self.issues.append({
+                    'rule': 'snake_case_column',
+                    'severity': 'low',
+                    'line': self._find_line(c) + 1,
+                    'message': f'列名 "{c}" 不符合小写蛇形命名规范',
+                })
+
+    def _check_trailing_space(self):
+        for idx, line in enumerate(self.sql.splitlines()):
+            if line != line.rstrip():
+                self.issues.append({
+                    'rule': 'no_trailing_whitespace',
+                    'severity': 'info',
+                    'line': idx + 1,
+                    'message': f'第 {idx + 1} 行有行尾空格',
+                })
+
+    def _find_line(self, keyword):
+        upper_sql = self.sql.upper()
+        upper_kw = keyword.upper()
+        pos = upper_sql.find(upper_kw)
+        if pos < 0:
+            return 0
+        return self.sql.count('\n', 0, pos)
+
+    def fix(self):
+        fixed_sql = self.sql
+        if self.rules.get('select_star') and self.parsed:
+            pass
+        if self.rules.get('no_trailing_whitespace'):
+            lines = fixed_sql.splitlines()
+            lines = [l.rstrip() for l in lines]
+            fixed_sql = '\n'.join(lines)
+        return fixed_sql
+
+
+def cmd_score(args):
+    as_json = args.json
+    file_mode = args.file
+    if file_mode:
+        if not os.path.exists(file_mode):
+            print(f"❌ 文件不存在: {file_mode}")
+            return
+        with open(file_mode, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        sqls = split_sql_statements(content)
+        if not sqls:
+            print("❌ 文件中未找到SQL语句")
+            return
+        print(f"📂 正在分析 {len(sqls)} 条 SQL，按复杂度输出 TOP10...")
+        results = []
+        for idx, sql in enumerate(sqls, 1):
+            try:
+                scorer = ComplexityScorer(sql, db_path=args.db)
+                r = scorer.score()
+                results.append({'id': idx, 'sql': sql, 'result': r})
+            except:
+                pass
+        results.sort(key=lambda x: x['result']['score'])
+        top10 = results[:10]
+        if as_json:
+            output = {
+                'total': len(results),
+                'top10': [
+                    {
+                        'rank': i + 1,
+                        'id': r['id'],
+                        'score': r['result']['score'],
+                        'grade': r['result']['grade'],
+                        'sql': r['sql'][:200],
+                        'dimensions': {k: v['score'] for k, v in r['result']['dimensions'].items()},
+                    }
+                    for i, r in enumerate(top10)
+                ],
+            }
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+            return
+        for i, r in enumerate(top10, 1):
+            s = r['result']
+            print()
+            print(f"  🏆 TOP {i} (SQL #{r['id']})  评分: {s['score']}  {s['grade']}")
+            print(f"     SQL: {r['sql'][:120]}{'...' if len(r['sql']) > 120 else ''}")
+            for dim_name, dim in s['dimensions'].items():
+                bar_len = int(dim['score'] / 5)
+                bar = '█' * bar_len + '░' * (20 - bar_len)
+                print(f"     ⚙ {dim['name']:<14} |{bar}| {dim['score']:3d}分  {dim['description']}")
+        return
+    sql = args.sql
+    scorer = ComplexityScorer(sql, db_path=args.db)
+    result = scorer.score()
+    if as_json:
+        output = {
+            'score': result['score'],
+            'grade': result['grade'],
+            'sql': sql,
+            'dimensions': {
+                k: {'name': v['name'], 'value': v['value'], 'score': v['score'], 'description': v['description']}
+                for k, v in result['dimensions'].items()
+            },
+        }
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return
+    print_section("📊 SQL 复杂度评分")
+    print(f"  原 SQL: {sql[:120]}{'...' if len(sql) > 120 else ''}")
+    print()
+    score_bar_len = int(result['score'] / 5)
+    score_bar = '█' * score_bar_len + '░' * (20 - score_bar_len)
+    print(f"  综合评分: |{score_bar}|  {result['score']} 分")
+    print(f"  等级: {result['grade']}")
+    print()
+    print("  各维度评分:")
+    for dim_key, dim in result['dimensions'].items():
+        w = ComplexityScorer.DIMENSION_WEIGHTS[dim_key]
+        bar_len = int(dim['score'] / 5)
+        bar = '█' * bar_len + '░' * (20 - bar_len)
+        print(f"    ⚙ {dim['name']:<14} (权重 {w*100:0.0f}%) |{bar}| 扣除 {dim['score']:3d}分  {dim['description']}")
+
+
+def cmd_diff(args):
+    sql1 = args.original
+    sql2 = args.optimized
+    as_json = args.json
+    scorer1 = ComplexityScorer(sql1)
+    scorer2 = ComplexityScorer(sql2)
+    r1 = scorer1.score()
+    r2 = scorer2.score()
+    diff_score = r2['score'] - r1['score']
+    if as_json:
+        output = {
+            'original': {'score': r1['score'], 'grade': r1['grade'],
+                         'dimensions': {k: v['score'] for k, v in r1['dimensions'].items()}},
+            'optimized': {'score': r2['score'], 'grade': r2['grade'],
+                          'dimensions': {k: v['score'] for k, v in r2['dimensions'].items()}},
+            'diff_score': diff_score,
+            'improved': diff_score > 0,
+            'dimension_diffs': {
+                k: {'original': r1['dimensions'][k]['score'],
+                    'optimized': r2['dimensions'][k]['score'],
+                    'diff': r2['dimensions'][k]['score'] - r1['dimensions'][k]['score'],
+                    'improved': r2['dimensions'][k]['score'] < r1['dimensions'][k]['score']}
+                for k in r1['dimensions']
+            },
+        }
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return
+    print_section("📊 SQL 复杂度对比")
+    print(f"  原始:  {r1['score']} 分  {r1['grade']}")
+    print(f"  优化后: {r2['score']} 分  {r2['grade']}")
+    diff_symbol = '✅' if diff_score > 0 else ('⚠️' if diff_score == 0 else '❌')
+    print(f"  {diff_symbol} 评分差异: {diff_score:+d} 分 {'(提升)' if diff_score > 0 else ('(无变化)' if diff_score == 0 else '(下降)')}")
+    print()
+    print("  各维度对比:")
+    for dim_key in r1['dimensions']:
+        d1 = r1['dimensions'][dim_key]
+        d2 = r2['dimensions'][dim_key]
+        diff = d2['score'] - d1['score']
+        if diff < 0:
+            icon = '📗'
+        elif diff > 0:
+            icon = '📕'
+        else:
+            icon = '📘'
+        improved_tag = ' ✨ 改进' if diff < 0 else (' 退步' if diff > 0 else ' 无变化')
+        print(f"  {icon} {d1['name']:<14}  原始: -{d1['score']:3d}分  优化后: -{d2['score']:3d}分  差异: {diff:+d}分{improved_tag}")
+    print()
+    improved_dims = [k for k in r1['dimensions'] if r2['dimensions'][k]['score'] < r1['dimensions'][k]['score']]
+    if improved_dims:
+        print("  ✨ 改进的维度:")
+        for k in improved_dims:
+            d1 = r1['dimensions'][k]
+            d2 = r2['dimensions'][k]
+            print(f"     • {d1['name']}: {d1['description']}  →  {d2['description']}")
+
+
+def cmd_schema(args):
+    db_path = args.db
+    if not db_path or not os.path.exists(db_path):
+        print(f"❌ 数据库不存在: {db_path}")
+        return
+    if args.refresh:
+        mgr = SchemaManager.__new__(SchemaManager)
+        mgr.db_path = db_path
+        mgr.cache_path = os.path.join(os.path.dirname(os.path.abspath(db_path)) or '.', SchemaManager.CACHE_FILE)
+        mgr.schema = None
+        mgr._extract()
+        mgr._save_cache()
+        print(f"✅ Schema 缓存已刷新: {mgr.cache_path}")
+    mgr = SchemaManager(db_path)
+    as_json = args.json
+    if as_json:
+        print(json.dumps(mgr.schema, ensure_ascii=False, indent=2))
+        return
+    print_section(f"🗄  数据库 Schema 信息: {db_path}")
+    if not mgr.schema:
+        print("  ❌ 未提取到任何表信息")
+        return
+    for table_name, info in mgr.schema.items():
+        if table_name.startswith('_'):
+            continue
+        print(f"  📋 表: {table_name}")
+        print(f"     {'列名':<25} {'类型':<15} {'主键':<6} {'非空':<6} 默认值")
+        print(f"     {'-'*25} {'-'*15} {'-'*6} {'-'*6} {'-'*15}")
+        for col in info['columns']:
+            pk = '✅' if col['primary_key'] else ''
+            nn = '✅' if col['not_null'] else ''
+            dval = str(col['default']) if col['default'] is not None else ''
+            print(f"     {col['name']:<25} {col['type']:<15} {pk:<6} {nn:<6} {dval}")
+        if info.get('indexes'):
+            print()
+            print(f"     🔍 索引:")
+            for idx in info['indexes']:
+                uniq = '(唯一)' if idx['unique'] else ''
+                print(f"       • {idx['name']} {uniq}: ({', '.join(idx['columns'])})")
+        if info.get('foreign_keys'):
+            print()
+            print(f"     🔗 外键:")
+            for fk in info['foreign_keys']:
+                print(f"       • {fk['from']} → {fk['table']}.{fk['to']}")
+        print()
+
+
+def cmd_format(args):
+    sql = None
+    file_mode = args.file
+    fix_mode = args.fix
+    style = args.style
+    comma = args.comma
+    indent_str = ' ' * (args.indent or 4)
+    formatter_kwargs = {
+        'keyword_case': style,
+        'indent': indent_str,
+        'comma_position': comma,
+    }
+    if file_mode:
+        if not os.path.exists(file_mode):
+            print(f"❌ 文件不存在: {file_mode}")
+            return
+        with open(file_mode, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        sqls = split_sql_statements(content)
+        formatted_parts = []
+        for s in sqls:
+            fm = SQLFormatter(s, **formatter_kwargs)
+            formatted_parts.append(fm.format())
+        result = '\n\n'.join(formatted_parts)
+        if fix_mode:
+            bak = file_mode + '.bak'
+            if not os.path.exists(bak):
+                with open(bak, 'w', encoding='utf-8') as f:
+                    f.write(content)
+            with open(file_mode, 'w', encoding='utf-8') as f:
+                f.write(result + '\n')
+            print(f"✅ 已格式化 {file_mode} (备份: {bak})")
+        else:
+            print(result)
+        return
+    sql = args.sql
+    fm = SQLFormatter(sql, **formatter_kwargs)
+    result = fm.format()
+    print(result)
+
+
+def cmd_lint(args):
+    sql = None
+    file_mode = args.file
+    fix_mode = args.fix
+    config = args.config or '.sqlopt.yaml'
+    if file_mode:
+        if not os.path.exists(file_mode):
+            print(f"❌ 文件不存在: {file_mode}")
+            return
+        with open(file_mode, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        sqls = split_sql_statements(content)
+        all_issues = []
+        offset = 0
+        for idx, s in enumerate(sqls, 1):
+            ln = SQLLinter(s, config_path=config)
+            issues = ln.lint()
+            for iss in issues:
+                iss['sql_id'] = idx
+            all_issues.extend(issues)
+            offset += s.count('\n') + 2
+        if fix_mode:
+            fixed_sqls = []
+            for s in sqls:
+                ln = SQLLinter(s, config_path=config)
+                ln.lint()
+                fixed_sqls.append(ln.fix())
+            result = '\n\n'.join(fixed_sqls)
+            bak = file_mode + '.bak'
+            if not os.path.exists(bak):
+                with open(bak, 'w', encoding='utf-8') as f:
+                    f.write(content)
+            with open(file_mode, 'w', encoding='utf-8') as f:
+                f.write(result + '\n')
+            print(f"✅ 已自动修复可修复问题: {file_mode} (备份: {bak})")
+        print_section(f"🔍 Lint 检查: {file_mode}")
+        if not all_issues:
+            print("  ✅ 未发现规范问题")
+            return
+        sev_count = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+        for iss in all_issues:
+            sev_count[iss['severity']] = sev_count.get(iss['severity'], 0) + 1
+        print(f"  共发现 {len(all_issues)} 个问题: 🔴严重{sev_count['critical']} | 🟠高{sev_count['high']} | 🟡中{sev_count['medium']} | 🟢低{sev_count['low']} | ℹ️信息{sev_count['info']}")
+        print()
+        sev_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+        all_issues.sort(key=lambda x: sev_order.get(x['severity'], 99))
+        sev_icon = {'critical': '🔴', 'high': '🟠', 'medium': '🟡', 'low': '🟢', 'info': 'ℹ️'}
+        for iss in all_issues:
+            ic = sev_icon.get(iss['severity'], '⚪')
+            sid = iss.get('sql_id', 1)
+            print(f"  {ic} [SQL#{sid}:L{iss['line']}] [{iss['rule']}] {iss['message']}")
+        return
+    sql = args.sql
+    ln = SQLLinter(sql, config_path=config)
+    issues = ln.lint()
+    if fix_mode:
+        fixed = ln.fix()
+        print("修复后的 SQL:")
+        print(fixed)
+        print()
+    print_section("🔍 Lint 规范检查")
+    if not issues:
+        print("  ✅ 未发现规范问题")
+        return
+    sev_count = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+    for iss in issues:
+        sev_count[iss['severity']] = sev_count.get(iss['severity'], 0) + 1
+    print(f"  共发现 {len(issues)} 个问题: 🔴严重{sev_count['critical']} | 🟠高{sev_count['high']} | 🟡中{sev_count['medium']} | 🟢低{sev_count['low']} | ℹ️信息{sev_count['info']}")
+    print()
+    sev_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+    issues.sort(key=lambda x: sev_order.get(x['severity'], 99))
+    sev_icon = {'critical': '🔴', 'high': '🟠', 'medium': '🟡', 'low': '🟢', 'info': 'ℹ️'}
+    for iss in issues:
+        ic = sev_icon.get(iss['severity'], '⚪')
+        print(f"  {ic} [L{iss['line']}] [{iss['rule']}] {iss['message']}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='sqlopt',
@@ -1738,10 +2980,14 @@ def main():
 示例:
   python sqlopt.py parse "SELECT * FROM users WHERE id=1"
   python sqlopt.py analyze "SELECT * FROM users WHERE name LIKE '%张%'" --db test.db
+  python sqlopt.py score "SELECT * FROM users u JOIN orders o ON u.id=o.user_id" --json
+  python sqlopt.py score --file samples.sql --top 10
+  python sqlopt.py diff --original "SELECT * FROM u WHERE id IN (SELECT uid FROM o)" --optimized "SELECT * FROM u JOIN o ON u.id=o.uid"
+  python sqlopt.py schema --db test.db --refresh
+  python sqlopt.py format "select id,name from users where age>18" --style upper --comma leading
+  python sqlopt.py lint --file samples.sql --fix --config .sqlopt.yaml
   python sqlopt.py initdb --db test.db
   python sqlopt.py batch file.sql --db test.db --output report.md
-  python sqlopt.py batch app.log --log --db test.db --output report.md
-  python sqlopt.py samples
         """
     )
     sub = parser.add_subparsers(dest='command', required=True)
@@ -1768,6 +3014,42 @@ def main():
 
     p_samples = sub.add_parser('samples', help='显示10条示例SQL')
     p_samples.set_defaults(func=cmd_samples)
+
+    p_score = sub.add_parser('score', help='SQL 复杂度评分 (0-100分): 表数/JOIN/子查询/WHERE/临时表排序')
+    p_score.add_argument('sql', nargs='?', help='SQL语句 (与--file二选一)')
+    p_score.add_argument('--file', '-f', help='批量评分SQL文件，输出TOP10最复杂查询')
+    p_score.add_argument('--db', help='SQLite数据库 (用于检测临时表排序)')
+    p_score.add_argument('--json', action='store_true', help='JSON格式输出')
+    p_score.add_argument('--top', type=int, default=10, help='批量模式时输出前N个 (默认10)')
+    p_score.set_defaults(func=cmd_score)
+
+    p_diff = sub.add_parser('diff', help='对比两条SQL的复杂度评分差异，高亮改进维度')
+    p_diff.add_argument('--original', '-o', required=True, help='原始SQL')
+    p_diff.add_argument('--optimized', '-n', required=True, help='优化后SQL')
+    p_diff.add_argument('--json', action='store_true', help='JSON格式输出')
+    p_diff.set_defaults(func=cmd_diff)
+
+    p_schema = sub.add_parser('schema', help='从SQLite提取表结构(列/类型/主键/外键/索引)并缓存')
+    p_schema.add_argument('--db', required=True, help='SQLite数据库文件路径')
+    p_schema.add_argument('--refresh', action='store_true', help='强制刷新Schema缓存')
+    p_schema.add_argument('--json', action='store_true', help='JSON格式输出')
+    p_schema.set_defaults(func=cmd_schema)
+
+    p_format = sub.add_parser('format', help='格式化SQL: 关键字大写、子句换行、缩进对齐、逗号位置可配置')
+    p_format.add_argument('sql', nargs='?', help='SQL语句 (与--file二选一)')
+    p_format.add_argument('--file', '-f', help='格式化.sql文件')
+    p_format.add_argument('--style', choices=['upper', 'lower', 'preserve'], default='upper', help='关键字大小写风格 (默认: upper)')
+    p_format.add_argument('--comma', choices=['leading', 'trailing'], default='leading', help='逗号位置: 前置或后置 (默认: leading)')
+    p_format.add_argument('--indent', type=int, default=4, help='缩进空格数 (默认: 4)')
+    p_format.add_argument('--fix', action='store_true', help='直接修改文件 (仅--file模式)')
+    p_format.set_defaults(func=cmd_format)
+
+    p_lint = sub.add_parser('lint', help='SQL规范检查: 蛇形命名/保留字/JOIN ON/别名/行尾空格等')
+    p_lint.add_argument('sql', nargs='?', help='SQL语句 (与--file二选一)')
+    p_lint.add_argument('--file', '-f', help='检查.sql文件')
+    p_lint.add_argument('--config', '-c', help='.sqlopt.yaml 配置文件路径')
+    p_lint.add_argument('--fix', action='store_true', help='自动修复可修复问题')
+    p_lint.set_defaults(func=cmd_lint)
 
     args = parser.parse_args()
     args.func(args)
